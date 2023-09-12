@@ -1,0 +1,1965 @@
+---
+title: "1q Gain"
+author: "Noriyuki Shinagawa"
+date: '2022-07-19'
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo=TRUE, warning = FALSE, message = FALSE)
+
+```
+
+# 1q gain
+
+Analysis of a sample from a patient with a somatic gain in the q arm of chromosome 1.
+
+## Libraries
+
+Make sure to install them! Some of them are from `bioconductor`.
+
+```{r libraries}
+
+# For scRNAseq analysis
+library(Seurat)
+library(DoubletFinder)
+library(sctransform)
+library(glmGamPoi)
+
+# For plotting
+library(ggrepel)
+library(patchwork)
+library(shadowtext)
+library(ggpp)
+library(ggvenn)
+
+# For convenience
+library(data.table)
+library(tidyverse)
+
+# MAST for differential expression analysis
+library(MAST)
+library(NMF)
+
+# For GO analysis
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+```
+
+## Importing data and processing
+
+```{r processing}
+
+# List sample names and expected doublet rates
+samples <- c("Patient3_B2", "Patient3_D", "Patient1_B1", "Patient1_C1", "Patient2_B", "Patient4", "Patient5", "Patient4r", "Patient5r")
+rates.doublets <- c(.04, .04, .032, .032, .024, .046, .046, .046, .046)
+names(rates.doublets) <- samples
+
+# Read in 10X data from file
+data <-
+  lapply(
+    sprintf(
+      "data/%s_filtered_feature_bc_matrix",
+      samples
+    ),
+    Read10X
+  )
+
+names(data) <- samples
+
+# For each sample, create a Seurat object, remove high mitochondrial counts, and
+# find doublets
+objects <-
+  lapply(
+    samples,
+    function(sample) {
+      object <- CreateSeuratObject(
+        counts = data[[sample]],
+        project = "1q",
+        min.cells = 3,
+        min.features = 200
+      )
+      
+      object[["percent.mt"]] <-
+        PercentageFeatureSet(object, pattern = "^MT-")
+      
+      object <-
+        object %>%
+        subset(subset = percent.mt < 5) %>%
+        SCTransform(
+          method = "glmGamPoi",
+          vars.to.regress = "percent.mt"
+        ) %>%
+        RunPCA() %>%
+        RunUMAP(dims = 1:30) %>%
+        RunTSNE(dims = 1:30)
+        
+      bcmvn <-
+        object %>%
+        paramSweep_v3(PCs = 1:30, sct = TRUE) %>%
+        summarizeSweep(GT = FALSE) %>%
+        find.pK()
+      
+      pK <-
+        as.numeric(as.vector(top_n(bcmvn,1,BCmetric)[["pK"]]))
+      
+      nExp_poi <-
+        rates.doublets[[sample]] * nrow(object@meta.data)
+      
+      object <- doubletFinder_v3(
+        object,
+        PCs = 1:30,
+        pN = 0.25,
+        pK = pK,
+        nExp = nExp_poi,
+        reuse.pANN = FALSE,
+        sct = TRUE
+      )
+      
+      object@meta.data$DF <- object@meta.data[[8]]
+      object@meta.data$sample <- sample
+      
+      return(object)
+    }
+  )
+
+# Prepare the data for integration
+features <-
+  SelectIntegrationFeatures(
+    object.list = objects,
+    nfeatures = 3000
+  )
+
+objects <-
+  PrepSCTIntegration(
+    object.list = objects,
+    anchor.features = features
+  )
+
+# Find anchors and integrate
+samples.anchors <-
+  FindIntegrationAnchors(
+    object.list = objects,
+    normalization.method = "SCT",
+    anchor.features = features
+  )
+
+combined <-
+  IntegrateData(
+    anchorset = samples.anchors,
+    normalization.method = "SCT"
+  )
+
+DefaultAssay(combined) <- "integrated"
+
+# Run PCA, UMAP and t-SNE on the combined object and cluster
+combined <-
+  combined %>%
+  RunPCA() %>%
+  RunUMAP(dims = 1:30) %>%
+  RunTSNE(dims = 1:30) %>%
+  FindNeighbors(reduction = "pca", dims = 1:20) %>%
+  FindClusters(resolution = 0.3)
+
+```
+
+## Celltype annotations
+
+I annotated the celltypes first by aligning them with the Allen Brain Map single-cell RNA sequencing data at the subclass level. The class label is too general for this purpose, and the cluster label is too specific.
+
+Then, I consolidated the numerous excitatory neuron clusters into a single one and the three inhibitory neuron clusters into one. Also, I removed small clusters with high doublet rates.
+
+```{r annotation}
+
+# Read in annotated Allen Brain Map 10X data from file
+allen <- readRDS("allen_norm.rds")
+
+# Ensure the reference and query are both using the SCT assay
+DefaultAssay(combined) <- "SCT"
+DefaultAssay(allen) <- "SCT"
+
+# Find transfer anchors
+combined.anchors <-
+  FindTransferAnchors(
+    reference = allen,
+    query = combined,
+    normalization.method = 'SCT',
+    dims = 1:30
+  )
+
+# Transfer subclass labels to the query object
+predictions.subclass <-
+  TransferData(
+    anchorset = combined.anchors, 
+    refdata = allen$subclass_label,
+    dims = 1:30
+  )
+
+combined <-
+  AddMetaData(
+    combined,
+    metadata = predictions.subclass
+  )
+
+combined$subclass_label <- combined$predicted.id
+
+# Identify clusters with more than 10% doublets (arbitrary)
+t1 <-
+  combined@meta.data %>%
+  group_by(DF, seurat_clusters) %>%
+  summarise(count = n()) %>%
+  pivot_wider(names_from = DF, values_from = count) %>%
+  mutate(
+    n = Doublet + Singlet,
+    percent = Doublet / n,
+  ) %>% arrange(desc(percent))
+
+t1
+
+# Consolidate celltypes from the Allen Brain Map
+
+idents <-
+  c(
+    "0" = "Oligodendrocytes",
+    "1" = "Microglia",
+    "2" = "Oligodendrocytes",
+    "3" = "OPCs",
+    "4" = "Excitatory Neurons",
+    "5" = "Oligodendrocytes",
+    "6" = "Astrocytes",
+    "7" = "Oligodendrocytes",
+    "8" = "Astrocytes",
+    "9" = "Remove",
+    "10" = "Oligodendrocytes",
+    "11" = "Inhibitory Interneurons",
+    "12" = "Inhibitory Interneurons",
+    "13" = "Oligodendrocytes",
+    "14" = "Inhibitory Interneurons",
+    "15" = "Inhibitory Interneurons",
+    "16" = "Remove"
+  )
+
+combined <- RenameIdents(combined, idents)
+
+# Remove singlets and small clusters with high doublet rates identified above
+s <- subset(combined, subset = DF == "Singlet")
+s <- subset(s, idents = "Remove", invert = TRUE)
+
+# Lognormalize data to use for Vln and FeaturePlots instead of SCT
+s <- NormalizeData(s, assay = "RNA")
+
+saveRDS(
+  s,
+  file = format(
+    Sys.time(),
+    "%F_%H%M%S_annotated.rds"
+  )
+)
+
+```
+
+# InferCNV results
+
+Katie's inferCNV results are added onto the Seurat object as metadata.
+
+```{r inferCNV_results}
+
+patients <- c("Patient1", "Patient2", "Patient3", "Patient4", "Patient5")
+
+gains <-
+  lapply(
+    sprintf("data/%s_barcodes.txt" , patients),
+    read.delim
+  )
+
+gains <- bind_rows(gains)
+
+samples_to_patients <-
+  data.frame(
+    sample = samples,
+    patient = c("Patient3", "Patient3", "Patient1", "Patient1", "Patient2", "Patient4", "Patient5", "Patient4", "Patient5")
+  )
+
+s@meta.data <-
+  s@meta.data %>%
+  rownames_to_column(var = "barcode") %>%
+  left_join(gains, by = "barcode") %>%
+  left_join(samples_to_patients, by = "sample") %>%
+  column_to_rownames(var = "barcode") %>%
+  rename(gain = chr1q) %>%
+  dplyr::select(
+    nCount_RNA,
+    nFeature_RNA,
+    percent.mt,
+    sample,
+    patient,
+    seurat_clusters,
+    nCount_SCT,
+    nFeature_SCT,
+    gain,
+  )
+
+s@meta.data$celltype <- s@active.ident
+s@meta.data$gain <- factor(s@meta.data$gain)
+levels(s@meta.data$gain) <- c("1q", "1q", "no", "no")
+
+```
+
+### Defining Color Schemes
+
+Define colors for samples and celltypes to use throughout. I also reordered the celltypes in the Seurat object so that it makes more sense logically.
+
+```{r colors}
+
+# Color scheme for celltypes, following a darker saturated theme
+colors.celltypes <- c(
+  "Oligodendrocytes" = "#ee3300",
+  "OPCs" = "#ff8800",
+  "Astrocytes" = "#ffcc33",
+  "Excitatory Neurons" = "#119911",
+  "Inhibitory Interneurons" = "#1166cc",
+  "Microglia" = "#7722bb"
+)
+
+# Celltypes here for convenience
+celltypes <- names(colors.celltypes)
+
+s@meta.data$celltype <- factor(s@meta.data$celltype, levels = celltypes)
+s@active.ident <- factor(s@active.ident, levels = celltypes)
+
+# Save object
+saveRDS(
+  s,
+  file = format(
+    Sys.time(),
+    "%F_%H%M%S_annotated_with_gain.rds"
+  )
+)
+
+```
+
+### Image output
+
+Specifying the image output to be PNG and also creating a folder to place the output plots. SVG should be used when appropriate.
+
+```{r img_output}
+
+# Specify output filetype and create folder for organization; for png, ggsave defaults to 300 dpi
+filetype <- "png"
+dir.create(filetype)
+
+# Specify reduction to use for rest of code; alternatives are "umap" or "pca"
+reduction <- "umap"
+
+```
+
+## QC Plots (supplement)
+
+mRNA count, feature mRNAs, and percent mitochondrial gene plots to demonstrate quality control.
+
+```{r qc_supplement}
+
+p0 <- VlnPlot(
+  s,
+  features = c("nCount_RNA", "nFeature_RNA", "percent.mt"),
+  group.by = "sample",
+  pt.size = 0,
+) & theme(axis.title.x = element_blank())
+
+p0
+
+ggsave(file = paste0(filetype, "/vln_qc.", filetype), plot = p0, width = 8.88, height = 4.44)
+
+```
+
+## DimPlots
+
+### Custom Dimplot Axes
+
+This is an empty plot with just axes to overlay on top of the other DimPlots.
+
+```{r dimplot_axes}
+
+p1x <-
+  ggplot(
+    data.frame(
+      a = 0,
+      b = 0
+    ),
+    aes(a, b)
+  ) +
+  geom_blank() +
+  theme_minimal() +
+  xlab(
+    ifelse(
+      reduction == "tsne",
+      "tSNE 1",
+      "UMAP 1"
+    )
+  ) + ylab(
+    ifelse(
+      reduction == "tsne",
+      "tSNE 2",
+      "UMAP 2"
+    )
+  ) +
+  theme(
+    axis.line.y = element_line(arrow = grid::arrow(length = unit(0.1, "in"), ends = "last")),
+    axis.ticks.y = element_blank(),
+    axis.text.y = element_blank(),
+    axis.title.y = element_text(size = 15),
+    axis.line.x = element_line(arrow = grid::arrow(length = unit(0.1, "in"), ends = "last")),
+    axis.ticks.x = element_blank(),
+    axis.text.x = element_blank(),
+    axis.title.x = element_text(size = 15),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) & NoLegend()
+
+```
+
+`DimPlotClean` modifies `Seurat`'s built-in `DimPlot` function in the following ways:
+
+1. It removes the title
+2. It removes the default axes
+3. It overlays a custom set of axes created above
+
+```{r dimplotclean}
+
+DimPlotClean <- function(x, ...) {
+  p1 <- DimPlot(
+    x,
+    ...
+  ) + theme(plot.title = element_blank()) &
+  NoLegend() &
+  NoAxes()
+  
+  p1 + inset_element(
+    p1x,
+    left = 0,
+    bottom = 0,
+    right = 0.2,
+    top = 0.2
+  )
+}
+
+```
+
+### DimPlot by Celltype
+
+I overlayed `DimPlot` with custom celltype labels, which were created using `shadowtext`, which makes it much easier to read black text on a colored background.
+
+```{r dim_celltype}
+
+# Create directory for organization
+dir.create(paste0(filetype, "/DimPlots"))
+
+# Import a custom version of Seurat's LabelClusters that replaces geom_text with 
+# geom_shadowtext for better visualization
+source("custom_functions/LabelClusters_custom.R")
+environment(LabelClusters_custom) <- asNamespace('Seurat')
+
+assignInNamespace(
+  "LabelClusters",
+  LabelClusters_custom,
+  ns = "Seurat"
+)
+
+p1a <- DimPlotClean(
+  s,
+  reduction = reduction,
+  cols = colors.celltypes,
+  label = TRUE,
+  label.size = 6
+)
+
+# Add alpha to make overlaps more obvious
+p1a[[1]]$layers[[1]]$aes_params$alpha =  0.25
+
+# ggsave defaults to 300 dpi
+ggsave(
+  file = paste0(
+    filetype, "/DimPlots/", reduction, "_dimplot_celltype.", filetype
+  ), plot = p1a,
+  dpi = 600,
+  width = 8,
+  height = 8
+)
+
+```
+
+### DimPlot by Gain
+
+Cells with a 1q gain are highlighted in red. This is based on the gain status from the metadata.
+
+```{r dim_gain}
+
+p1c <- DimPlotClean(
+  s,
+  group.by = "gain",
+  cols = c("#dddddd", "#ee3300"),
+  reduction = reduction,
+  order = "1q"
+)
+
+# Add alpha to make overlaps more obvious
+p1c[[1]]$layers[[1]]$aes_params$alpha =  0.5
+
+p1c
+
+ggsave(
+  file = paste0(filetype, "/DimPlots/", reduction, "_dimplot_gain.", filetype),
+  plot = p1c,
+  dpi = 600,
+  width = 8,
+  height = 8,
+)
+
+```
+
+## Celltype Gene Markers
+
+* Oligodendrocytes: MOG, MBP
+* OPC: PDGFRA
+* Astrocytes: ALDH1L1, SLC1A2, AQP4
+* Excitatory neurons: SLC17A7
+* Innhibitory neurons: GAD1
+* Microglia: P2RY12
+
+### FeaturePlots for Gene Markers
+
+`FeaturePlots` were made without axes, and colored based on the celltype colors defined earlier.
+
+```{r celltype_markers}
+
+DefaultAssay(s) <- "RNA"
+
+colors.celltypes["Neurons"] <- "#11806f"
+
+# Define gene markers for each cluster
+gene.markers <- c(
+  "MOG" = "Oligodendrocytes",
+  "MBP" = "Oligodendrocytes",
+  "PDGFRA" = "OPCs",
+  "MYT1" = "OPCs",
+  "AQP4" = "Astrocytes",
+  "ALDH1L1" = "Astrocytes",
+  "SLC1A2" = "Astrocytes",
+  "GFAP" = "Astrocytes",
+  "RBFOX3" = "Neurons",
+  "SLC17A7" = "Excitatory Neurons",
+  "GAD1" = "Inhibitory Interneurons",
+  "P2RY12" = "Microglia"
+)
+
+# Create directory for organization
+dir.create(paste0(filetype, "/FeaturePlots"))
+
+# Create a FeaturePlot for each gene
+p2a <- lapply(
+  names(gene.markers),
+  function(gene) {
+    p2 <- FeaturePlot(
+      s,
+      features = gene,
+      cols = c("#dddddd", colors.celltypes[gene.markers[gene]]),
+      reduction = reduction,
+      order = TRUE
+    ) & NoLegend() &
+    NoAxes() +
+    theme(
+      plot.title = element_text(face = "italic")
+    )
+    
+    ggsave(
+      file = paste0(
+        filetype, "/FeaturePlots/", reduction, "_feature_", gene , ".", filetype
+      ), plot = p2,
+      width = 6,
+      height = 6
+    )
+   
+    # Adjust transparency manually to make oberlaps more obvious
+    p2[[1]]$layers[[1]]$aes_params$alpha =  0.5
+   
+    p2
+  }
+)
+
+# Add axes to bottom right plot
+p2a[[12]] <-
+  p2a[[12]] + inset_element(
+    p1x + scale_y_continuous(
+      position = "right"
+    ) + theme(
+      axis.line.x = element_line(
+        arrow = grid::arrow(length = unit(0.1, "in"), ends = "first")
+      )
+    ),
+    left = 0.75,
+    bottom = 0,
+    top = 0.5,
+    right = 1.25
+  )
+
+
+# Combine plots; since there are 12, this is a 3 by 4 layout
+p2b <- Reduce('/', p2a[1:3]) |Reduce('/', p2a[4:6]) | Reduce('/', p2a[7:9]) | Reduce('/', p2a[10:12])
+
+# Create dummy plot for legend
+p2c <-
+  FeaturePlot(
+    s,
+    features = "MOG",
+    cols = c("#dddddd", "#000000"),
+    reduction = reduction,
+    order = TRUE
+  ) + scale_color_continuous(
+    breaks = c(0, 3),
+    labels = c("Low", "High"),
+    low = "#dddddd",
+    high = "#000000"
+  ) & NoAxes() +
+  theme(
+    plot.title = element_blank()
+  ) 
+
+# Combine plots with legend
+p2d <-
+  p2b + p2c + guide_area() + plot_layout(
+    guides = "collect", widths = c(4, 4, 4, 4, 0, 1)
+  )
+
+ggsave(
+  file = paste0(
+    filetype, "/FeaturePlots/", reduction, "_feature_summary.", filetype
+  ),
+  plot = p2d,
+  width = 12.75,
+  height = 9
+)
+
+```
+
+### VlnPlot Summary of Gene Markers
+
+This is a custom colored `VlnPlot` for celltype confirmation. This is preferred over the `DotPlot` because it is cleaner and also gives more information.
+
+```{r celltype_summary_vlnplot}
+
+# First gene with y-axis
+p4a <-
+  VlnPlot(
+    s,
+    features = names(gene.markers[1]),
+    pt.size = 0,
+    assay = "RNA",
+    cols = colors.celltypes) +
+  coord_flip() + 
+  ylab(names(gene.markers[1])) +
+  scale_x_discrete(limits = rev) +
+  scale_y_continuous(position = "right") +
+  theme(
+    axis.title.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.ticks.x = element_blank(),
+    axis.line.x = element_blank(),
+    axis.text.x = element_blank(),
+    plot.title = element_blank(),
+    plot.margin = margin(r = 0)
+  ) & NoLegend()
+
+# Other genes
+p4b <-
+  lapply(
+  names(gene.markers[-1]),
+    function(gene) {
+      VlnPlot(
+        s,
+        features = gene,
+        pt.size = 0,
+        assay = "RNA",
+        cols = colors.celltypes) +
+      coord_flip() + 
+      ylab(gene) +
+      scale_x_discrete(limits = rev) +
+      scale_y_continuous(position = "right") +
+      theme(
+        axis.title.y = element_blank(),
+        #axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        #axis.text.y = element_blank(),
+        #axis.ticks.x = element_blank(),
+        axis.line.x = element_blank(),
+        #axis.text.x = element_blank(),
+        plot.title = element_blank(),
+        plot.margin = margin(l = 0, r = 0)
+      ) & NoLegend()
+    }
+  )
+
+# Combine plots together and format the gene name
+p4c <-
+  Reduce('|', c(list(p4a), p4b)) &
+  theme(
+    axis.title.x.top = element_text(
+      hjust = 0,
+      vjust = 0.5,
+      angle = 45,
+      face = "italic",
+      margin = margin(t = 22, b = -22)
+    ), plot.margin = margin(
+      t = 5.5, b = 5.5
+    )
+  )
+
+# Add margins and save plot
+p4c <-
+  p4c + plot_annotation(
+    theme = theme(
+      plot.margin = margin(l = 11, r = 11)
+    )
+  )
+
+p4c
+
+ggsave(
+  paste0(filetype, "/", "vln_genemarkers.", filetype),
+  plot = p4c,
+  width = 8,
+  height = 4
+)
+
+```
+
+## Celltype distribution
+
+### Celltype distributions
+
+I used dplyr to simplify calculations. Some of the plots aren't necessary, but they might be useful later.
+
+```{r celltype_distributions}
+
+# Create directory for organization
+dir.create(paste0(filetype, "/BarPlots"))
+
+# Count how many of each celltype in each sample
+count.sample <-
+  s@meta.data %>%
+  group_by(sample, celltype) %>%
+  summarise(count = n()) %>%
+  mutate(percent = count / sum(count))
+
+# Find order of decreasing counts by sample
+count.decreasing.sample <-
+  (count.sample %>%
+  summarise(count = sum(count)) %>%
+  arrange(desc(count)))$sample
+
+# Stacked bar plot for percentages
+p5b <-
+  ggplot(
+    data = count.sample,
+    aes(x = sample, y = percent, fill = celltype)
+  ) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = colors.celltypes) +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust= 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) + NoLegend()
+
+p5b
+
+ggsave(
+  file = paste0(
+    filetype, "/BarPlots/percents.", filetype
+  ), plot = p5b,
+  width = 4,
+  height = 4
+)
+
+# Reorder levels by decreasing counts
+count.sample$sample <-
+  factor(
+    count.sample$sample,
+    levels = count.decreasing.sample
+  )
+
+# Stacked bar plot for counts
+p5a <-
+  ggplot(
+    data = count.sample,
+    aes(x = sample, y = count, fill = celltype)
+  ) +
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values = colors.celltypes) +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust= 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) + NoLegend()
+
+ggsave(
+  file = paste0(
+    filetype, "/BarPlots/counts.", filetype
+  ), plot = p5a,
+  width = 4,
+  height = 4
+)
+
+```
+
+## VAF
+
+It is interesting to see which samples and which celltypes have a higher VAF.
+
+### Overall VAF
+
+```{r vaf_overall}
+
+# Summarize genotype
+genotype.summary <- summary(s@meta.data$gain)
+genotype.summary
+
+# Calculate overall VAF
+vaf.overall <- unname(genotype.summary["1q"] / sum(genotype.summary))
+vaf.overall
+
+```
+
+### VAF by Sample
+
+```{r vaf_by_sample}
+
+# Calculate VAF by sample
+vaf.sample <-
+  s@meta.data %>%
+  group_by(sample, gain) %>%
+  summarise(count = n()) %>%
+  mutate(percent = count / sum(count)) %>%
+  filter(gain == "1q") %>%
+  arrange(desc(percent))
+
+# Reorder samples by descending VAF
+vaf.sample$sample <-
+  factor(
+    vaf.sample$sample,
+    levels = vaf.sample$sample
+  )
+
+# Simple bar plot
+p6a <-
+  ggplot(
+    data = vaf.sample,
+    aes(x = sample, y = percent, fill = sample)
+  ) +
+  geom_bar(stat = "identity") +
+  theme_classic() + 
+  theme(
+    axis.text.x = element_text(angle = 45, hjust= 1),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank()
+  ) + NoLegend()
+
+p6a
+
+ggsave(
+  file = paste0(
+    filetype, "/BarPlots/vaf_sample.", filetype
+  ), plot = p6a,
+  width = 4,
+  height = 4
+)
+
+```
+
+### VAF by Celltype
+
+```{r vaf_by_celltype}
+
+# Calculate VAF by celltype
+vaf.celltypes <-
+  s@meta.data %>%
+  group_by(celltype, gain) %>%
+  summarise(count = n()) %>%
+  mutate(percent = count / sum(count)) %>%
+  mutate(n = sum(count))
+
+# Ensure that the celltype order is consistent throughout
+vaf.celltypes$celltype <- factor(vaf.celltypes$celltype, levels = celltypes)
+
+# Flip factor order of gain for plotting
+vaf.celltypes$gain <- factor(vaf.celltypes$gain, levels = c("no", "1q"))
+
+```
+
+### VAF by Patient for Specific Celltypes
+
+This is the interesting graph. There seems to be consistent gain in the astrocytes across the samples, whereas oligodendrocyte and excitatory neuron VAFs seem more variable.
+
+```{r vaf_by_sample_specific_celltype}
+
+# The three celltypes of interest
+celltypes.specific <- c("Oligodendrocytes", "Astrocytes", "Excitatory Neurons")
+
+# Calculate VAF by celltype by patient; converting from longer to wider and back to longer is a workaround to fill missing values
+# Correction for Patient1 and Patient3: use only non-reference samples for VAF calculation due to the inclusion of a reference (ie 1q negative sample)
+vaf.patient.celltypes.specific <-
+  s@meta.data %>%
+  filter(!(sample %in% c("Patient1_C1", "Patient3_D"))) %>%
+  group_by(patient, celltype, gain, .drop = FALSE) %>%
+  summarise(count = n()) %>%
+  mutate(percent = count / sum(count)) %>%
+  mutate(n = sum(count))
+
+vaf.patient.celltypes.specific$celltype <- factor(vaf.patient.celltypes.specific$celltype, levels = celltypes)
+
+# Ensure that the celltype order is consistent throughout
+vaf.patient.celltypes.specific$celltype <- factor(vaf.patient.celltypes.specific$celltype, levels = celltypes)
+
+# Flip factor order of gain for plotting
+vaf.patient.celltypes.specific$gain <- factor(vaf.patient.celltypes.specific$gain, levels = c("no", "1q"))
+
+# Bar plot for overall
+p13b <-
+  ggplot(
+    vaf.celltypes %>% filter(
+      celltype %in% celltypes.specific
+    ),
+    aes(
+      x = celltype,
+      y = percent,
+      fill = gain,
+      label = ifelse(
+        gain == "no",
+        sprintf(
+          "%s (n = %d)",
+          as.character(celltype),
+          n
+        ),
+        ""
+      )
+    )
+  ) + geom_bar(
+    position = "stack",
+    stat = "identity",
+  ) + geom_shadowtext(
+    position = position_stacknudge(
+      vjust = 1,
+      y = -0.02
+    ),
+    hjust = 1,
+    color = "black",
+    bg.colour = "white",
+    size = 12
+  ) + scale_fill_manual(
+    name = "",
+    values = c("#dddddd", "#ee3300"),
+    labels = c('No gain', '1q gain'),
+    guide = guide_legend(
+      reverse = TRUE,
+      override.aes = list(size = 20)
+    )
+  ) + theme_classic() +
+  coord_flip() +
+  xlab("All Patients") +
+  theme(
+    axis.text.x = element_blank(),
+    axis.title.x = element_blank(),
+    axis.ticks.length.x = unit(.25, "cm"),
+    axis.text.y = element_blank(),
+    axis.line.y = element_blank(),
+    axis.ticks.y = element_blank(),
+    axis.title.y = element_text(angle = 90, hjust = 0.5),
+    text = element_text(size = 40)
+  ) + ylim(0, 1)
+
+# DimPlot for each patient
+p13c <-
+  lapply(
+    patients,
+    function(patient1) {
+      if (patient1 == "Patient1") {
+        subset <- subset(
+          s,
+          subset = sample == "Patient1_B1"
+        )
+      } else if (patient1 == "Patient3") {
+        subset <- subset(
+          s,
+          subset = sample == "Patient3_B2"
+        )
+      } else {
+        subset <- subset(
+          s,
+          subset = patient == patient1
+        )
+      }
+      
+      p <- DimPlot(
+        subset,
+        group.by = "gain",
+        reduction = reduction,
+        order = "1q",
+        cols = c("#dddddd", "#ee3300")
+      ) & NoAxes(
+      ) & NoLegend(
+      ) & theme(
+        plot.title = element_blank()
+      )
+      
+      # Adjust transparency manually to make overlaps more obvious
+      p[[1]]$layers[[1]]$aes_params$alpha =  0.5
+      p
+    }
+  )
+
+# Put axes on bottom left corner
+## replace a later
+p13c[[length(p13c)]] <-
+  p13c[[length(p13c)]] + inset_element(
+    p1x,
+    left = 0.1,
+    bottom = -0.4,
+    right = 0.7,
+    top = 0.2
+  )
+
+
+# Bar charts for each patient
+p13d <-
+  lapply(
+    patients,
+    function(patient1) {
+      ggplot(
+        vaf.patient.celltypes.specific %>% filter(
+          celltype %in% celltypes.specific & patient == patient1
+        ),
+        aes(
+          x = celltype,
+          y = percent,
+          fill = gain,
+          label = ifelse(
+            gain == "no",
+            sprintf(
+              "%s (n = %d)",
+              as.character(celltype),
+              n
+            ),
+            ""
+          )
+        )
+      ) + geom_bar(
+        position = "stack",
+        stat = "identity",
+      ) + geom_shadowtext(
+        position = position_stacknudge(
+          vjust = 1,
+          y = -0.02
+        ),
+        hjust = 1,
+        color = "black",
+        bg.colour = "white",
+        size = 12
+      ) + scale_fill_manual(
+        name = "",
+        values = c("#dddddd", "#ee3300"),
+        labels = c('No gain', '1q gain'),
+        guide = guide_legend(
+          reverse = TRUE,
+          override.aes = list(size = 20)
+        )
+      ) + theme_classic() +
+      coord_flip() +
+      xlab(patient1) +
+      theme(
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.length.x = unit(.25, "cm"),
+        axis.text.y = element_blank(),
+        axis.line.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.y = element_text(angle = 90, hjust = 0.5),
+        text = element_text(size = 40)
+      ) + ylim(0, 1)
+    }
+  )
+
+# Add legend to bottom bar chart
+p13d[[length(p13d)]] <- 
+  p13d[[length(p13d)]] +
+  ylab(
+    "% cells with 1q gain"
+  ) + theme(
+    axis.text.x = element_text(
+      angle = 45,
+      hjust = 1,
+      vjust = 1
+    ),
+    axis.title.x = element_text(),
+  ) + scale_y_continuous(
+    labels = scales::percent
+  )
+
+# Combine plots together
+p13 <-
+  Reduce("+", c(list(guide_area()), p13c, list(p13b), p13d)) +
+  plot_layout(
+    byrow = FALSE,
+    ncol = 2,
+    widths = c(1, 2),
+    guides = 'collect'
+  ) + plot_annotation(
+    theme = theme(
+      plot.margin = margin(l = 16.5, b = 5.5, r = 5.5, t = 5.5)
+    )
+  )
+
+p13[[6]][[2]] <-
+  p13[[6]][[2]] + theme(
+    axis.title.x = element_text(size = 30),
+    axis.title.y = element_text(size = 30)
+  )
+
+ggsave(
+  file = paste0( 
+    filetype, "/gain_figure.", filetype
+  ), plot = p13,
+  width = 12,
+  height = 25.5,
+  dpi = 800
+)
+
+```
+
+## Differential expression analysis
+
+Adapted from the MAST vignette.
+
+### FindMarkersMAST
+
+`FindMarkersMAST` is a custom function to perform `MAST` differential expression analysis. Requires `MAST` package, available from `bioconductor`. The main difference between this function and the `FindMarkers` function provided by `Seurat` is that the `logFC` is calculated based on the `MAST` algorithm rather than a simple average calculation as performed by `Seurat`. The function is currently designed to work best when finding differentially expressed genes between two groups specified in the `@meta.data` within a single `ident`, such as between `1q` vs. `no gain` cells within astrocytes.
+
+```{r findmarkersmast}
+
+FindMarkersMAST <-
+  function(
+    object,
+    ident.1,
+    ident.2,
+    group.by,
+    subset.ident,
+    min.pct = 0.1,
+    random.effect = character(0)
+  ) {
+    # subset cluster of interest
+    object.subset <- subset(object, idents = subset.ident)
+    
+    # Set default assay to RNA and normalize
+    DefaultAssay(object.subset) <- "RNA"
+    object.subset <- NormalizeData(object.subset)
+    
+    # Extract counts from subset object and filter out genes expressed in less than 10% of cells
+    counts <- as.matrix(object.subset@assays$RNA@data)
+    counts <- counts[rowSums(counts > 0) / (ncol(counts)) >= min.pct,]
+    
+    # Prepare a list of genes to model
+    features <- data.frame(primerid = rownames(counts))
+    
+    # Include important metadata
+    levels <- c(ident.2, ident.1)
+    metadata <- data.frame(
+      condition = factor(
+        object.subset@meta.data[[group.by]],
+      levels = levels)
+    )
+    
+    # If a random effect is specified, make sure to include it in the metadata
+    if (length(random.effect)) {
+      metadata$re <- factor(object.subset@meta.data[[random.effect]])
+    }
+    
+    # Create single cell assay
+    assay <- MAST::FromMatrix(
+      exprsArray = counts,
+      cData = metadata,
+      fData = features
+    )
+    
+    # Recalculate cellular detection rate and add to assay
+    detections <- colSums(SummarizedExperiment::assay(assay) > 0)
+    SummarizedExperiment::colData(assay)$cngeneson <- scale(detections)
+    
+    # Perform zero-inflated regression
+    # If a random effect is specified, the glmer method is used instead of the default method
+    if (length(random.effect)) {
+      fit <-
+        MAST::zlm(
+          ~ condition + cngeneson + (1 | re),
+          assay,
+          method = 'glmer',
+          ebayes = FALSE,
+          strictConvergence = FALSE
+        )
+    } else {
+      fit <- MAST::zlm(
+        ~ condition + cngeneson,
+        assay
+      )
+    }
+    
+    # Summarize experiment in data table
+    experiment <- paste0('condition', levels[2])
+    summary <- MAST::summary(fit, doLRT = experiment)
+    table <- summary$datatable
+    
+    # convert p value to FDR
+    hurdle <- merge(
+      table[
+        contrast == experiment & component == "H",
+        .(primerid, `Pr(>Chisq)`)
+      ], table[
+        contrast == experiment & component == "logFC",
+        .(primerid, coef)
+      ], by = "primerid"
+    )
+    hurdle[, fdr := p.adjust(`Pr(>Chisq)`, 'fdr')]
+    hurdle <- stats::na.omit(as.data.frame(hurdle))
+  
+    return(hurdle)
+  }
+
+```
+
+### PrepareVolcano
+
+Function to add a column that represents differential expression status just for convenience.
+
+```{r preparevolcano}
+
+PrepareVolcano <-
+  function(
+    data,
+    specific = NULL,
+    cutoff.fc = 1.3,
+    cutoff.fdr = 0.05
+  ) {
+    data$de <- "no"
+    data$de[data$fdr < cutoff.fdr & data$coef < -log2(cutoff.fc)] <- "down"
+    data$de[data$fdr < cutoff.fdr & data$coef > log2(cutoff.fc)] <- "up"
+    data$color <- data$de
+    data$color[data$primerid %in% specific] <- "specific"
+    data$label <- ifelse(data$primerid %in% specific, data$primerid, "")
+    
+    return(data)
+  }
+
+```
+
+### VolcanoPlot
+
+Function to plot a volcano plot. Blue for downregulated, red for upregulated, and black for special, which in this case, plots the 1q genes. I might several more classifications later based on the findings from functional analysis.
+
+```{r volcanoplot}
+
+# Volcano Plot for use with MAST output
+VolcanoPlot <-
+  function(
+    data,
+    cutoff.fc = 1.3,
+    cutoff.fdr = 0.05,
+    max.overlaps = 5,
+    priority = NULL
+  ) {
+    p <-
+      ggplot(
+        data = data %>% arrange(desc(color)),
+        aes(
+          x = coef,
+          y = -log10(fdr),
+          col = color,
+          label = label
+        )
+      ) +
+      theme_minimal() +
+      geom_vline(
+        xintercept = c(-log2(cutoff.fc), log2(cutoff.fc)),
+        col = c("#1166cc", "#ee3300"),
+        linetype = "dashed"
+      ) + geom_hline(
+        yintercept = -log10(cutoff.fdr),
+        col = "#dddddd",
+        linetype = "dashed"
+      ) + geom_point(mapping = aes(size = abs(coef))) +
+      geom_text_repel(
+        max.overlaps = max.overlaps,
+        min.segment.length = 0,
+        show.legend = FALSE
+      ) + geom_text_repel(
+        data = data %>% filter(primerid %in% priority),
+        max.overlaps = max.overlaps,
+        min.segment.length = 0,
+        show.legend = FALSE
+      ) + xlab("log2(FC)") +
+      ylab("-log10(FDR)") +
+      scale_colour_manual(
+        values = c(
+          "no" = "#dddddd",
+          "down" = "#1166cc",
+          "up" = "#ee3300",
+          "specific" = "#000000"
+        ),
+        breaks = c("up", "down"),
+        labels = c(
+          paste0('Up: n = ', sum(data$de == "up")),
+          paste0('Down: n = ', sum(data$de == "down"))
+        )
+      ) +
+      scale_radius(range = c(0.01, 1)) +
+      theme(
+        legend.position = c(0.5, 0.9)
+      ) + guides(
+        size = "none",
+        color = guide_legend(title = paste0("Total: n = ",  nrow(data)))
+      )
+    
+    ranges <-
+      ggplot_build(p) %>% 
+      pluck("layout", "panel_params", 1) %>% 
+      `[`("x.range")
+    
+    p <- p + theme(
+      legend.position = c(-ranges$x.range[1] / diff(ranges$x.range), 0.9),
+      legend.justification = c(0.5, 0.5)
+    )
+    
+    return(p)
+  }
+
+```
+
+### Applying the functions
+
+Running the differential expression analysis and creating a volcano plot.
+
+```{r de}
+
+# Create directory for organization
+dir.create("deg")
+dir.create(paste0(filetype, "/VolcanoPlots"))
+
+# Read in list of genes on 1q
+genes.1q <-read.delim("1q_table.txt") %>% pull(hg38.kgXref.geneSymbol)
+
+# Run MAST analysis for Oligodendrocytes
+deg.oligodendrocytes <-
+  FindMarkersMAST(
+    object = s,
+    ident.1 = "1q",
+    ident.2 = "no",
+    group.by = "gain",
+    subset.ident = "Oligodendrocytes"
+  )
+
+write.csv(
+  deg.oligodendrocytes,
+  file = paste0(
+    format(
+      Sys.time(),
+      "deg/%F_%H%M%S_oligodendrocytes.csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+# Run MAST analysis for Astrocytes
+deg.astrocytes <-
+  FindMarkersMAST(
+    object = s,
+    ident.1 = "1q",
+    ident.2 = "no",
+    group.by = "gain",
+    subset.ident = "Astrocytes"
+  )
+
+write.csv(
+  deg.astrocytes,
+  file = paste0(
+    format(
+      Sys.time(),
+      "deg/%F_%H%M%S_astrocytes.csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+# Run MAST analysis for Excitatory Neurons
+deg.excitatoryneurons <-
+  FindMarkersMAST(
+    object = s,
+    ident.1 = "1q",
+    ident.2 = "no",
+    group.by = "gain",
+    subset.ident = "Excitatory Neurons"
+  )
+
+write.csv(
+  deg.excitatoryneurons,
+  file = paste0(
+    format(
+      Sys.time(),
+      "deg/%F_%H%M%S_excitatoryneurons.csv"
+    )
+  ),
+  row.names = FALSE
+)
+
+deg.oligodendrocytes <-
+  PrepareVolcano(
+    deg.oligodendrocytes,
+    cutoff.fc = 1.3
+  )
+
+deg.astrocytes <-
+  PrepareVolcano(
+    deg.astrocytes,
+    cutoff.fc = 1.3
+  )
+
+deg.excitatoryneurons <-
+  PrepareVolcano(
+    deg.excitatoryneurons,
+    cutoff.fc = 1.3
+  )
+
+```
+
+## Gene Ontology
+
+Gene ontology analysis using clusterProfiler
+
+### GO for Oligodendrocytes
+
+```{r go_oligodendrocytes}
+
+go1 <- enrichGO(
+  gene = deg.oligodendrocytes %>% filter(de != "no") %>% pull(primerid),
+  universe      = deg.oligodendrocytes$primerid,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "fdr",
+  qvalueCutoff  = 0.05
+)
+
+p9a <-
+  dotplot(go1) +
+  scale_color_continuous(
+    high = "#dddddd", low = "#ee3300"
+  )
+
+p9b <-
+  cnetplot(
+    go1,
+    color.params = list(
+      foldChange = deg.oligodendrocytes %>% dplyr::select(primerid, coef) %>% deframe() %>% sign(),
+      category = "#666666"
+    )
+  ) + scale_color_gradient2(
+    mid = "#dddddd", high = "#ee3300", low = "#1166cc"
+  ) & NoLegend()
+
+deg.oligodendrocytes <-
+  PrepareVolcano(
+    deg.oligodendrocytes,
+    cutoff.fc = 1.3,
+    specific = c(
+      strsplit(
+        paste(
+          go1@result %>% filter(qvalue < 0.05) %>% pull(geneID),
+          collapse = "/"
+        ),
+        "/"
+      )[[1]] %>%
+      unique(),
+      "AKT3"
+    )
+  )
+
+p8a <-
+  VolcanoPlot(
+    deg.oligodendrocytes,
+    cutoff.fc = 1.3,
+    priority = "AKT3"
+  )
+
+p8a
+
+ggsave(
+  sprintf(
+    "%s/go/dotplot_oligodendrocytes.%s",
+    filetype,
+    filetype
+  ),
+  plot = p9a,
+  width = 6,
+  height = 6
+)
+
+ggsave(
+  sprintf(
+    "%s/go/cnetplot_oligodendrocytes.%s",
+    filetype,
+    filetype
+  ),
+  plot = p9b,
+  width = 6,
+  height = 6
+)
+
+ggsave(
+  sprintf(
+    "%s/VolcanoPlots/volcano_oligodendrocytes.%s",
+    filetype,
+    filetype
+  ),
+  plot = p8a,
+  width = 6,
+  height = 4
+)
+
+```
+
+### GO for Astrocytes
+
+```{r go_astrocytes}
+
+go2 <- enrichGO(
+  gene = deg.astrocytes %>% filter(de != "no") %>% pull(primerid),
+  universe      = deg.astrocytes$primerid,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "fdr",
+  qvalueCutoff  = 0.05
+)
+
+p9c <-
+  dotplot(go2) +
+  scale_color_continuous(
+    high = "#dddddd", low = "#ee3300"
+  )
+
+p9d <-
+  cnetplot(
+    go2,
+    color.params = list(
+      foldChange = deg.astrocytes %>% dplyr::select(primerid, coef) %>% deframe() %>% sign(),
+      category = "#666666"
+    )
+  ) + scale_color_gradient2(
+    mid = "#dddddd", high = "#ee3300", low = "#1166cc"
+  ) & NoLegend()
+
+deg.astrocytes <-
+  PrepareVolcano(
+    deg.astrocytes,
+    cutoff.fc = 1.3,
+    specific = c(
+      strsplit(
+        paste(
+          go2@result %>% filter(qvalue < 0.05) %>% pull(geneID),
+          collapse = "/"
+        ),
+        "/"
+      )[[1]] %>%
+      unique(),
+      "AKT3"
+    )
+  )
+
+p8b <-
+  VolcanoPlot(
+    deg.astrocytes,
+    cutoff.fc = 1.3,
+    priority = "AKT3"
+  )
+
+p8b
+
+
+ggsave(
+  sprintf(
+    "%s/go/dotplot_astrocytes.%s",
+    filetype,
+    filetype
+  ),
+  plot = p9c,
+  width = 6,
+  height = 6
+)
+
+ggsave(
+  sprintf(
+    "%s/go/cnetplot_astrocytes.%s",
+    filetype,
+    filetype
+  ),
+  plot = p9d,
+  width = 6,
+  height = 6
+)
+
+ggsave(
+  sprintf(
+    "%s/VolcanoPlots/volcano_astrocytes.%s",
+    filetype,
+    filetype
+  ),
+  plot = p8b,
+  width = 6,
+  height = 4
+)
+```
+
+### GO for Excitatory Neurons
+
+```{r go_excitatoryneurons}
+
+go3 <- enrichGO(
+  gene = deg.excitatoryneurons %>% filter(de != "no") %>% pull(primerid),
+  universe      = deg.excitatoryneurons$primerid,
+  OrgDb         = org.Hs.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "fdr",
+  qvalueCutoff  = 0.05
+)
+
+p9e <-
+  dotplot(go3) +
+  scale_color_continuous(
+    high = "#dddddd", low = "#ee3300"
+  )
+
+p9f <-
+  cnetplot(
+    go3,
+    color.params = list(
+      foldChange = deg.excitatoryneurons %>% dplyr::select(primerid, coef) %>% deframe() %>% sign(),
+      category = "#666666"
+    )
+  ) + scale_color_gradient2(
+    mid = "#dddddd", high = "#ee3300", low = "#1166cc"
+  ) & NoLegend()
+
+deg.excitatoryneurons <-
+  PrepareVolcano(
+    deg.excitatoryneurons,
+    cutoff.fc = 1.3,
+    specific = c(
+      strsplit(
+        paste(
+          go3@result %>% filter(qvalue < 0.05) %>% pull(geneID),
+          collapse = "/"
+        ),
+        "/"
+      )[[1]] %>%
+      unique(),
+      "AKT3"
+    )
+  )
+
+p8c <-
+  VolcanoPlot(
+    deg.excitatoryneurons,
+    cutoff.fc = 1.3,
+    priority = "AKT3"
+  )
+
+p8c
+
+ggsave(
+  sprintf(
+    "%s/go/dotplot_excitatoryneurons.%s",
+    filetype,
+    filetype
+  ),
+  plot = p9e,
+  width = 6,
+  height = 6
+)
+
+ggsave(
+  sprintf(
+    "%s/go/cnetplot_excitatoryneurons.%s",
+    filetype,
+    filetype
+  ),
+  plot = p9f,
+  width = 6,
+  height = 6
+)
+
+ggsave(
+  sprintf(
+    "%s/VolcanoPlots/volcano_excitatoryneurons.%s",
+    filetype,
+    filetype
+  ),
+  plot = p8c,
+  width = 6,
+  height = 4
+)
+
+```
+
+### Venn Diagram for DEGs
+
+```{r venn}
+
+venn.data <-
+  list(
+    "Astrocyte DEGs" = deg.astrocytes %>% filter(de != "no") %>% pull(primerid),
+    "Excitatory\nNeuron DEGs" = deg.excitatoryneurons %>% filter(de != "no") %>% pull(primerid),
+    "1q genes" = genes.1q
+  )
+
+venn.diagram <-
+  ggvenn(
+    venn.data, c("Astrocyte DEGs", "Excitatory\nNeuron DEGs", "1q genes"),
+    show_percentage = FALSE,
+    fill_color = c(unname(colors.celltypes["Astrocytes"]), unname(colors.celltypes["Excitatory Neurons"]), "#ee3300")
+  )
+
+ggsave(
+  paste0(filetype, "/", "venn.", filetype),
+  plot = venn.diagram,
+  width = 6,
+  height = 6
+)
+
+```
+
+## Tables
+
+### Table of gain by celltype by patient
+
+```{r table_gain_celltype_patient}
+
+t1 <-
+  s@meta.data %>%
+  filter(!(sample %in% c("Patient1_C1", "Patient3_D"))) %>%
+  group_by(patient, celltype, gain) %>%
+  summarise(count = n()) %>%
+  pivot_wider(names_from = gain, values_from = count, values_fill = 0) %>%
+  mutate(total = no + `1q`) %>%
+  mutate(vaf = `1q` / total)
+
+write.csv(t1, "tables.csv", row.names = FALSE)
+
+p17a <-
+  ggplot(
+    t1,
+    aes(
+      fill = celltype,
+      x = patient,
+      y = vaf,
+      label = sprintf(
+        "n = %d",
+        total
+      )
+    )
+  ) +
+  geom_bar(
+    position = "dodge",
+    stat = "identity",
+    color = "#000000"
+  ) + scale_fill_manual(values = colors.celltypes) +
+  geom_text(
+    position = position_dodgenudge(
+      0.9,
+      y = 0.02
+    ),
+    angle = 90,
+    vjust = 0.5,
+    hjust = 0,
+  ) +
+  scale_y_continuous(
+    labels = scales::percent,
+    breaks = c(0, 0.25, 0.5, 0.75, 1),
+    minor_breaks = c(0.125, 0.375, 0.625, 0.875),
+    limits = c(0, 1.2)
+  ) + guides(
+    fill = guide_legend(title="Celltype")
+  ) + theme_minimal() +
+  ylab("% cells with 1q gain") +
+  theme(
+    axis.title.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  )
+
+ggsave(
+  paste0(filetype, "/", "full_celltype_gain.", filetype),
+  plot = p17a,
+  width = 6,
+  height = 4
+)
+
+# Alternative figure: relative proportions of celltypes that make up the 1q cells by patient
+t2 <-
+  s@meta.data %>%
+  filter(!(sample %in% c("Patient1_C1", "Patient3_D"))) %>%
+  group_by(patient, celltype, gain, .drop = FALSE) %>%
+  summarise(count = n()) %>%
+  filter(gain == "1q") %>%
+  group_by(patient, .drop = FALSE) %>%
+  mutate(proportion = count / sum(count))
+
+p17b <-
+  ggplot(
+    t2,
+    aes(
+      fill = celltype,
+      x = patient,
+      y = proportion
+    )
+  ) +
+  geom_bar(
+    position = "stack",
+    stat = "identity",
+    color = "#000000"
+  ) + scale_fill_manual(values = colors.celltypes) +
+  scale_y_continuous(
+    labels = scales::percent
+  ) + guides(
+    fill = guide_legend(title="Celltype")
+  ) + theme_minimal() +
+  ylab("Relative proportions of 1q gain cells by") +
+  theme(
+    axis.title.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+ggsave(
+  paste0(filetype, "/", "gain_celltype_proportion_by_patient.", filetype),
+  plot = p17b,
+  width = 6,
+  height = 4
+)
+
+```
+
+## Heatmap of top genes for each celltype
+
+```{r heatmap}
+
+DefaultAssay(s) <- "integrated"
+
+markers.all <-
+  FindAllMarkers(
+    s,
+    only.pos = TRUE,
+    min.pct = 0.25,
+    logfc.threshold = 0.25
+  )
+
+markers.top5 <-
+  markers.all %>%
+  filter(pct.1 > 0.5) %>%
+  group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+p10 <-
+  DoHeatmap(
+    s,
+    features = markers.top5$gene,
+    group.colors = colors.celltypes,
+    label = FALSE
+  ) + scale_fill_gradient2(
+    low = "#7722bb",
+    mid = "#000000",
+    high = "#ffcc33"
+  )
+
+ggsave(
+  paste0(filetype, "/", "heatmap.", filetype),
+  plot = p10,
+  width = 12,
+  height = 8
+)
+
+```
+
+## Astrocytes check
+
+```{r astrocytes_check}
+
+astrocytes <- subset(s, idents = "Astrocytes")
+
+markers.astrocytes <-
+  c(
+    "AQP4",
+    "ALDH1L1",
+    "SLC1A2",
+    "GFAP",
+    "ALDOC",
+    "ACSBG1",
+    "APOE",
+    "GJA1",
+    "FGFR3"
+  )
+
+levels(astrocytes@meta.data$gain) <- c("1q gain", "no gain")
+astrocytes@meta.data$gain <- factor(astrocytes@meta.data$gain, levels = c("no gain", "1q gain"))
+
+p11 <-
+  VlnPlot(
+    astrocytes,
+    features = markers.astrocytes,
+    group.by = "gain",
+    assay = "RNA",
+    cols = c(
+      "no gain" = "#ffffff",
+      "1q gain" = "#ee3300"
+    ),
+    pt.size = 0
+  ) & theme(
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    plot.title = element_text(face = "italic"),
+  )
+
+p11[[1]] <-
+  p11[[1]] +
+  theme(
+    axis.title.y = element_text(
+      angle = 90
+    )
+  )
+
+ggsave(
+  paste0(filetype, "/", "astrocyte_1q_check.", filetype),
+  plot = p11,
+  width = 12,
+  height = 8
+)
+
+```
+
+## Session Info
+
+```{r session}
+
+sessionInfo()
+
+```
